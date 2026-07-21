@@ -1,0 +1,12 @@
+[project]
+name = "muninn"
+version = "0.1.0"
+description = "Muninn: page-citable RAG knowledge base + MCP server for Ardian's research PDFs"
+# capped <3.14: onnxruntime (fastembed) wheels not yet reliable on 3.14
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "pymupdf>=1.24",
+    "fastembed>=0.3",
+    "qdrant-client>=1.9",
+    "mcp>=1.9",
+]

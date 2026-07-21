@@ -1,0 +1,8 @@
+/pdfs
+/notes
+/qdrant_db
+/.idea
+/__pycache__
+
+.env
+.secret
