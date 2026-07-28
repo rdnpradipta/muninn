@@ -18,6 +18,8 @@ import fitz  # PyMuPDF
 from fastembed import TextEmbedding
 from qdrant_client import QdrantClient, models
 
+import citations  # DOI -> APA (Crossref/DataCite via doi.org, cached)
+
 # --- Config (must match muninn_mcp.py) ---
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 VECTOR_DIM = 384
@@ -90,6 +92,27 @@ def ingest_notes(client: QdrantClient, embedder: TextEmbedding) -> None:
     if not files:
         print("[notes] none found, skipping")
         return
+
+    # Notes are ingested after the PDFs, so enrich them from each document's
+    # meta point. This keeps note search results consistent with raw hits:
+    # both carry the DOI and APA-7 in-text citation.
+    citations_by_doc: dict[str, dict] = {}
+    offset = None
+    while True:
+        meta_points, offset = client.scroll(
+            COLLECTION, limit=500, offset=offset, with_payload=True,
+            scroll_filter=models.Filter(must=[models.FieldCondition(
+                key="type", match=models.MatchValue(value="meta"))]),
+        )
+        for point in meta_points:
+            payload = point.payload
+            citations_by_doc[payload["doc_id"]] = {
+                "doi": payload.get("doi"),
+                "apa_inline": payload.get("apa_inline"),
+            }
+        if offset is None:
+            break
+
     for f in files:
         for line in f.read_text().splitlines():
             if not line.strip():
@@ -113,7 +136,8 @@ def ingest_notes(client: QdrantClient, embedder: TextEmbedding) -> None:
             for ci, ((ctext, _, _), vec) in enumerate(zip(chunks, vectors)):
                 payload = {"doc_id": did, "title": n["title"],
                            "source_file": n["source_file"], "type": "claude_note",
-                           "chunk_index": ci, "text": ctext}
+                           "chunk_index": ci, "text": ctext,
+                           **citations_by_doc.get(did, {})}
                 if ci == 0 and n.get("key_quotes"):
                     payload["key_quotes"] = n["key_quotes"]
                 points.append(models.PointStruct(
@@ -142,21 +166,31 @@ def main() -> None:
                                     models.PayloadSchemaType.KEYWORD)
         client.create_payload_index(COLLECTION, "page",
                                     models.PayloadSchemaType.INTEGER)
+        client.create_payload_index(COLLECTION, "doi",
+                                    models.PayloadSchemaType.KEYWORD)
 
     embedder = TextEmbedding(EMBED_MODEL)
+    cite_cache = citations._load_cache()   # shared across docs, saved once below
 
     for path in pdfs:
         did = doc_id_for(path)
-        # idempotent: wipe existing raw/page points for this doc
+        # idempotent: wipe existing raw/page/meta points for this doc
         client.delete(
             COLLECTION,
             points_selector=models.FilterSelector(filter=models.Filter(must=[
                 models.FieldCondition(key="doc_id",
                                       match=models.MatchValue(value=did)),
                 models.FieldCondition(key="type",
-                                      match=models.MatchAny(any=["raw", "page"])),
+                                      match=models.MatchAny(
+                                          any=["raw", "page", "meta"])),
             ])),
         )
+
+        # --- APA citation from the DOI encoded in the filename ---
+        cite = citations.citation_for(path.name, cache=cite_cache) or {}
+        cite_fields = {"doi": cite.get("doi"),
+                       "apa_inline": cite.get("inline")}
+
         doc = fitz.open(path)
         title = guess_title(doc, path)
         total_pages = doc.page_count
@@ -167,7 +201,8 @@ def main() -> None:
             if not page_text:
                 continue
             base = {"doc_id": did, "title": title, "source_file": path.name,
-                    "page": pno + 1, "total_pages": doc.page_count}
+                    "page": pno + 1, "total_pages": doc.page_count,
+                    **cite_fields}
             # full page text (type=page) for get_page — zero vector cost is
             # avoided by embedding page text too (cheap, and page-level recall helps)
             for ci, (ctext, cs, ce) in enumerate(chunk_page(page_text)):
@@ -177,6 +212,22 @@ def main() -> None:
                 n_chunks += 1
             points.append(("page", f"{did}:p{pno+1}:full",
                            {**base, "type": "page", "text": page_text}))
+
+        # --- one meta point per doc: the full APA citation record ---
+        meta_payload = {
+            "doc_id": did, "title": title, "source_file": path.name,
+            "total_pages": total_pages, "type": "meta",
+            "doi": cite.get("doi"),
+            "apa_inline": cite.get("inline"),
+            "apa_narrative": cite.get("narrative"),
+            "apa_reference": cite.get("reference"),
+            "apa_authors": cite.get("authors_intext"),
+            "year": cite.get("year"),
+            "citation_unresolved": cite.get("unresolved", not cite),
+            # embed the reference so the paper is findable by its bibliographic text
+            "text": cite.get("reference") or f"{title} {cite.get('doi', '')}",
+        }
+        points.append(("meta", f"{did}:meta", meta_payload))
         doc.close()
 
         if not points:
@@ -192,9 +243,10 @@ def main() -> None:
             )
             for (_, key, payload), vec in zip(points, vectors)
         ])
-        print(f"[ok] {title[:60]!r}  doc_id={did}  "
-              f"pages={total_pages}  chunks={n_chunks}")
+        print(f"[ok] {title[:55]!r}  doc_id={did}  pages={total_pages}  "
+              f"chunks={n_chunks}  cite={cite.get('inline', 'UNRESOLVED')}")
 
+    citations._save_cache(cite_cache)   # persist resolved DOIs for offline re-ingest
     ingest_notes(client, embedder)
 
     info = client.get_collection(COLLECTION)
